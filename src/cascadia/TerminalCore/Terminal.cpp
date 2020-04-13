@@ -190,6 +190,9 @@ void Terminal::UpdateSettings(winrt::Microsoft::Terminal::Settings::ICoreSetting
     // bottom in the new buffer as well. Track that case now.
     const bool originalOffsetWasZero = _scrollOffset == 0;
 
+    // skip any drawing updates that might occur until we swap _buffer with the new buffer.
+    _buffer->GetCursor().StartDeferDrawing();
+
     // First allocate a new text buffer to take the place of the current one.
     std::unique_ptr<TextBuffer> newTextBuffer;
     try
@@ -198,6 +201,8 @@ void Terminal::UpdateSettings(winrt::Microsoft::Terminal::Settings::ICoreSetting
                                                      _buffer->GetCurrentAttributes(),
                                                      0, // temporarily set size to 0 so it won't render.
                                                      _buffer->GetRenderTarget());
+
+        newTextBuffer->GetCursor().StartDeferDrawing();
 
         // Build a PositionInformation to track the position of both the top of
         // the mutable viewport and the top of the visible viewport in the new
@@ -214,15 +219,25 @@ void Terminal::UpdateSettings(winrt::Microsoft::Terminal::Settings::ICoreSetting
         oldRows.visibleViewportTop = newVisibleTop;
 
         const std::optional<short> oldViewStart{ oldViewportTop };
-        RETURN_IF_FAILED(TextBuffer::Reflow(*_buffer.get(),
-                                            *newTextBuffer.get(),
-                                            _mutableViewport,
-                                            { oldRows }));
+        const HRESULT reflowHR = TextBuffer::Reflow(*_buffer.get(),
+                                                    *newTextBuffer.get(),
+                                                    _mutableViewport,
+                                                    { oldRows });
+
+        if (FAILED(reflowHR))
+        {
+            _buffer->GetCursor().EndDeferDrawing();
+            return reflowHR;
+        }
 
         newViewportTop = oldRows.mutableViewportTop;
         newVisibleTop = oldRows.visibleViewportTop;
     }
-    CATCH_RETURN();
+    catch (...)
+    {
+        _buffer->GetCursor().EndDeferDrawing();
+        RETURN_CAUGHT_EXCEPTION();
+    }
 
     // Conpty resizes a little oddly - if the height decreased, and there were
     // blank lines at the bottom, those lines will get trimmed. If there's not
@@ -328,6 +343,9 @@ void Terminal::UpdateSettings(winrt::Microsoft::Terminal::Settings::ICoreSetting
     _mutableViewport = Viewport::FromDimensions({ 0, proposedTop }, viewportSize);
 
     _buffer.swap(newTextBuffer);
+
+    // Now that the new buffer was swapped to be Terminal's buffer, we can tell its cursor to start drawing again.
+    _buffer->GetCursor().EndDeferDrawing();
 
     // GH#3494: Maintain scrollbar position during resize
     // Make sure that we don't scroll past the mutableViewport at the bottom of the buffer
@@ -886,8 +904,9 @@ CATCH_LOG()
 //   Visible, then it will immediately become visible.
 // Arguments:
 // - isVisible: whether the cursor should be visible
-void Terminal::SetCursorOn(const bool isOn) noexcept
+void Terminal::SetCursorOn(const bool isOn)
 {
+    auto lock = LockForWriting();
     _buffer->GetCursor().SetIsOn(isOn);
 }
 
